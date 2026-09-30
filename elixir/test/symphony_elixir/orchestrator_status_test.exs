@@ -791,12 +791,29 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert due_in_ms >= 0
     assert due_in_ms <= 4_000
 
+    state_payload = SymphonyElixirWeb.Presenter.state_payload(orchestrator_name, 5_000)
+
+    assert %{
+             polling: %{
+               checking?: false,
+               poll_interval_ms: 30_000,
+               next_poll_in_ms: presenter_due_in_ms
+             }
+           } = state_payload
+
+    assert is_integer(presenter_due_in_ms)
+    assert presenter_due_in_ms >= 0
+    assert presenter_due_in_ms <= 4_000
+
     :sys.replace_state(pid, fn state ->
       %{state | poll_check_in_progress: true, next_poll_due_at_ms: nil}
     end)
 
     snapshot = GenServer.call(pid, :snapshot)
     assert %{polling: %{checking?: true, next_poll_in_ms: nil}} = snapshot
+
+    state_payload = SymphonyElixirWeb.Presenter.state_payload(orchestrator_name, 5_000)
+    assert %{polling: %{checking?: true, poll_interval_ms: 30_000, next_poll_in_ms: nil}} = state_payload
   end
 
   test "orchestrator triggers an immediate poll cycle shortly after startup" do

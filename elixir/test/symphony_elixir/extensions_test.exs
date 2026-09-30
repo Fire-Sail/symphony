@@ -314,7 +314,12 @@ defmodule SymphonyElixir.ExtensionsTest do
                "total_tokens" => 12,
                "seconds_running" => 42.5
              },
-             "rate_limits" => %{"primary" => %{"remaining" => 11}}
+             "rate_limits" => %{"primary" => %{"remaining" => 11}},
+             "polling" => %{
+               "checking?" => false,
+               "next_poll_in_ms" => 1_500,
+               "poll_interval_ms" => 30_000
+             }
            }
 
     conn = get(build_conn(), "/api/v1/MT-HTTP")
@@ -376,6 +381,63 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert %{"queued" => true, "coalesced" => false, "operations" => ["poll", "reconcile"]} =
              json_response(conn, 202)
+  end
+
+  test "phoenix observability api exposes orchestrator polling snapshot through GET /api/v1/state" do
+    orchestrator_name = Module.concat(__MODULE__, :PollingObservabilityOrchestrator)
+
+    snapshot_waiting =
+      static_snapshot()
+      |> Map.put(:polling, %{
+        checking?: false,
+        next_poll_in_ms: 4_200,
+        poll_interval_ms: 30_000
+      })
+
+    {:ok, pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot_waiting,
+        refresh: %{queued: true, coalesced: false, requested_at: DateTime.utc_now(), operations: ["poll"]}
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    conn = get(build_conn(), "/api/v1/state")
+    assert conn.status == 200
+    state_payload = json_response(conn, 200)
+
+    assert %{
+             "polling" => %{
+               "checking?" => false,
+               "next_poll_in_ms" => 4_200,
+               "poll_interval_ms" => 30_000
+             }
+           } = state_payload
+
+    snapshot_checking =
+      static_snapshot()
+      |> Map.put(:polling, %{
+        checking?: true,
+        next_poll_in_ms: nil,
+        poll_interval_ms: 30_000
+      })
+
+    :sys.replace_state(pid, fn state ->
+      Keyword.put(state, :snapshot, snapshot_checking)
+    end)
+
+    conn2 = get(build_conn(), "/api/v1/state")
+    assert conn2.status == 200
+    state_payload2 = json_response(conn2, 200)
+
+    assert %{
+             "polling" => %{
+               "checking?" => true,
+               "next_poll_in_ms" => nil,
+               "poll_interval_ms" => 30_000
+             }
+           } = state_payload2
   end
 
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
@@ -703,7 +765,12 @@ defmodule SymphonyElixir.ExtensionsTest do
         }
       ],
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
-      rate_limits: %{"primary" => %{"remaining" => 11}}
+      rate_limits: %{"primary" => %{"remaining" => 11}},
+      polling: %{
+        checking?: false,
+        next_poll_in_ms: 1_500,
+        poll_interval_ms: 30_000
+      }
     }
   end
 
