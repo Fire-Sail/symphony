@@ -260,9 +260,17 @@ defmodule SymphonyElixir.Orchestrator do
       |> reconcile_blocked_issues()
 
     with :ok <- Config.validate!(),
-         {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states),
-         true <- available_slots(state) > 0 do
-      choose_issues(issues, state)
+         {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states) do
+      issue_count = length(issues)
+      issue_ids = Enum.map(issues, &(&1.identifier || &1.id))
+
+      Logger.info("Tracker poll completed: issue_count=#{issue_count} issue_ids=#{inspect(issue_ids)}")
+
+      if available_slots(state) > 0 do
+        choose_issues(issues, state)
+      else
+        state
+      end
     else
       {:error, :missing_linear_api_token} ->
         Logger.error("Tracker API token missing in WORKFLOW.md")
@@ -300,9 +308,6 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.error("Failed to fetch from issue tracker: #{inspect(reason)}")
-        state
-
-      false ->
         state
     end
   end
@@ -786,8 +791,11 @@ defmodule SymphonyElixir.Orchestrator do
     |> sort_issues_for_dispatch()
     |> Enum.reduce(state, fn issue, state_acc ->
       if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
+        Logger.info("Issue accepted for dispatch: #{issue_context(issue)}")
         dispatch_issue(state_acc, issue)
       else
+        reason = diagnose_rejection_reason(issue, state_acc, active_states, terminal_states)
+        Logger.info("Issue rejected for dispatch: #{issue_context(issue)} reason=#{reason}")
         state_acc
       end
     end)
@@ -829,6 +837,71 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp should_dispatch_issue?(_issue, _state, _active_states, _terminal_states), do: false
+
+  defp diagnose_rejection_reason(
+         %Issue{} = issue,
+         %State{} = state,
+         active_states,
+         terminal_states
+       ) do
+    diagnose_candidate_rejection(issue, active_states, terminal_states) ||
+      diagnose_concurrency_rejection(issue, state) ||
+      "not eligible for dispatch"
+  end
+
+  defp diagnose_rejection_reason(_issue, _state, _active_states, _terminal_states) do
+    "invalid issue struct or missing required string fields"
+  end
+
+  defp diagnose_candidate_rejection(issue, active_states, terminal_states) do
+    cond do
+      terminal_issue_state?(issue.state, terminal_states) ->
+        "issue in terminal state (#{issue.state})"
+
+      not active_issue_state?(issue.state, active_states) ->
+        "issue not in active states (#{issue.state})"
+
+      issue.dispatchable != true ->
+        "issue marked not dispatchable by tracker (dispatchable=false, blocked_by=#{length(issue.blocked_by || [])})"
+
+      not issue_routable?(issue) ->
+        "issue not routable (missing required labels)"
+
+      not candidate_issue?(issue, active_states, terminal_states) ->
+        "issue not eligible as candidate (missing required fields)"
+
+      true ->
+        nil
+    end
+  end
+
+  defp diagnose_concurrency_rejection(
+         %Issue{id: id, state: issue_state},
+         %State{running: running, claimed: claimed, blocked: blocked} = state
+       ) do
+    cond do
+      MapSet.member?(claimed, id) ->
+        "issue already claimed"
+
+      Map.has_key?(running, id) ->
+        "issue already running"
+
+      Map.has_key?(blocked, id) ->
+        "issue currently blocked"
+
+      available_slots(state) <= 0 ->
+        "no orchestrator slots available"
+
+      not state_slots_available?(%Issue{id: id, state: issue_state}, running) ->
+        "max concurrent agents limit reached for state (#{issue_state})"
+
+      not worker_slots_available?(state) ->
+        "no worker slots available"
+
+      true ->
+        nil
+    end
+  end
 
   defp state_slots_available?(%Issue{state: issue_state}, running) when is_map(running) do
     limit = Config.max_concurrent_agents_for_state(issue_state)
@@ -905,6 +978,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
+    Logger.info("Dispatch attempt reached for #{issue_context(issue)}")
+
     case refresh_issue_for_dispatch(issue) do
       {:ok, %Issue{} = refreshed_issue} ->
         do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
